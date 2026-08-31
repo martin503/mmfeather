@@ -1,10 +1,77 @@
+import math
+
 import torch
+from einops import rearrange, repeat, unpack
 from jaxtyping import Float, Int
 from torch import Tensor, nn
 from torchfeather.model.moe import FeedForward, MoE
 
 from torchfeather.model.model_args import DeepSeekV3ModelArgs
-from torchfeather.model.rope import precompute_freqs_cis
+from torchfeather.model.rope import apply_rotary_emb, precompute_freqs_cis
+
+
+class Attention(nn.Module):
+    def __init__(self, model_args: DeepSeekV3ModelArgs):
+        super().__init__()
+
+        self.dim = model_args.dim
+        self.n_heads = model_args.n_heads
+        self.q_lora_rank = model_args.q_lora_rank
+        self.kv_lora_rank = model_args.kv_lora_rank
+        self.qk_nope_head_dim = model_args.qk_nope_head_dim
+        self.qk_rope_head_dim = model_args.qk_rope_head_dim
+        self.qk_head_dim = model_args.qk_nope_head_dim + model_args.qk_rope_head_dim
+        self.v_head_dim = model_args.v_head_dim
+
+        if self.q_lora_rank == 0:
+            self.wq = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=False)
+        else:
+            self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
+            self.q_norm = nn.RMSNorm(self.q_lora_rank, eps=model_args.norm_eps)
+            self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.qk_head_dim, bias=False)
+        self.wkv_a = nn.Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim, bias=False)
+        self.kv_norm = nn.RMSNorm(self.kv_lora_rank, eps=model_args.norm_eps)
+        self.wkv_b = nn.Linear(
+            self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False
+        )
+        self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.dim, bias=False)
+        self.softmax_scale = self.qk_head_dim**-0.5
+
+        if model_args.max_seq_len > model_args.original_seq_len:
+            mscale = 0.1 * model_args.mscale * math.log(model_args.rope_factor) + 1.0
+            self.softmax_scale = self.softmax_scale * mscale**2
+
+        self.inner_attention = ScaledDotProductAttentionWrapper()
+
+    def forward(self, x: Float[Tensor, "B S D"], freqs_cis: Float[Tensor, "S H"]):
+        if self.q_lora_rank == 0:
+            q = self.wq(x)
+        else:
+            q = self.wq_a(x)
+            q = self.wq_b(self.q_norm(q))
+
+        q = rearrange(q, "b s (h d) -> b s h d", h=self.n_heads, d=self.qk_head_dim)
+        q_nope, q_pe = unpack(q, [[self.qk_nope_head_dim], [self.qk_rope_head_dim]], "b s h *")
+        q_pe = apply_rotary_emb(q_pe, freqs_cis)
+        q = torch.cat([q_nope, q_pe], dim=-1)
+
+        kv = self.wkv_a(x)
+        kv, k_pe = unpack(kv, [[self.kv_lora_rank], [self.qk_rope_head_dim]], "b s *")
+        k_pe = apply_rotary_emb(rearrange(k_pe, "b s rh -> b s 1 rh"), freqs_cis)
+        kv = self.wkv_b(self.kv_norm(kv))
+        kv = rearrange(kv, "b s (h kv) -> b s h kv", h=self.n_heads)
+        k_nope, v = unpack(kv, [[self.qk_nope_head_dim], [self.v_head_dim]], "b s h *")
+        k = torch.cat(
+            [k_nope, repeat(k_pe, "b s 1 rh -> b s repeat rh", repeat=self.n_heads)], dim=-1
+        )
+
+        q = rearrange(q, "b s h d -> b h s d")
+        k = rearrange(k, "b s h d -> b h s d")
+        v = rearrange(v, "b s h d -> b h s d")
+
+        output = self.inner_attention(q, k, v, scale=self.softmax_scale)
+        output = rearrange(output, "b h s d -> b s (h d)")
+        return self.wo(output)
 
 
 class TransformerBlock(nn.Module):
@@ -12,7 +79,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.attention = Attention(model_args)
         self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.ffn_norm = nn.RMSNorm
+        self.ffn_norm = nn.RMSNorm()
 
         self.moe_enabled = layer_id >= model_args.n_dense_layers
         if self.moe_enabled:
