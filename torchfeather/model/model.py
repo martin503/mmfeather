@@ -43,7 +43,9 @@ class Attention(nn.Module):
 
         self.inner_attention = ScaledDotProductAttentionWrapper()
 
-    def forward(self, x: Float[Tensor, "B S D"], freqs_cis: Float[Tensor, "S H"]):
+    def forward(
+        self, x: Float[Tensor, "B S D"], freqs_cis: Float[Tensor, "S H"]
+    ) -> Float[Tensor, "B S D"]:
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
@@ -73,13 +75,85 @@ class Attention(nn.Module):
         output = rearrange(output, "b h s d -> b s (h d)")
         return self.wo(output)
 
+    @torch.no_grad()
+    def absorb_mla_weights(self) -> None:
+        if self.q_lora_rank != 0:
+            raise NotImplementedError()
+        n_heads = self.n_heads
+        dim = self.dim
+        qk_nope_head_dim = self.qk_nope_head_dim
+        qk_rope_head_dim = self.qk_rope_head_dim
+        v_head_dim = self.v_head_dim
+        kv_lora_rank = self.kv_lora_rank
+
+        device = self.wq.weight.device
+        dtype = self.wq.weight.dtype
+
+        wq = rearrange(self.wq.weight, "(nh hd) d -> nh hd d", nh=n_heads)
+        wq_nope, wq_rope = unpack(wq, [[qk_nope_head_dim], [qk_rope_head_dim]], "nh * d")
+        wkv_b = rearrange(self.wkv_b.weight, "(nh hd) l -> nh hd l", nh=n_heads)
+        w_uk, w_uv = unpack(wkv_b, [[qk_nope_head_dim], [v_head_dim]], "nh * l")
+
+        wq_abs_nope = torch.bmm(rearrange(w_uk.float(), "nh l d -> nh d l"), wq_nope.float()).to(
+            dtype=dtype
+        )
+        wq_abs = rearrange(torch.cat([wq_abs_nope, wq_rope], dim=1), "nh hd d -> (nh hd) d")
+        self.wq_abs = nn.Linear(
+            dim,
+            n_heads * (kv_lora_rank + qk_rope_head_dim),
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
+        self.wq_abs.weight.copy_(wq_abs)
+        self.wq_abs.requires_grad_(False)
+
+        w_o = rearrange(self.wo.weight, "d (nh v) -> nh d v", nh=n_heads)
+        w_o_abs_per_head = torch.bmm(w_o.float(), w_uv.float()).to(dtype=dtype)
+        w_o_abs = rearrange(w_o_abs_per_head, "nh d l -> d (nh l)")
+        self.wo_abs = nn.Linear(
+            n_heads * kv_lora_rank, dim, bias=False, device=device, dtype=dtype
+        )
+        self.wo_abs.weight.copy_(w_o_abs)
+        self.wo_abs.requires_grad_(False)
+
+    def forward_absorbed(
+        self, x: Float[Tensor, "B S D"], freqs_cis: Float[Tensor, "S H"]
+    ) -> Float[Tensor, "B S D"]:
+        assert self.wq_abs is not None
+        assert self.wo_abs is not None
+
+        q = self.wq_abs(x)
+        q = rearrange(q, "b s (nh a) -> b s nh a", nh=self.n_heads)
+        q_nope, q_rope = unpack(q, [[self.kv_lora_rank], [self.qk_rope_head_dim]], "b s nh *")
+        q_rope = apply_rotary_emb(q_rope, freqs_cis)
+        q = rearrange(torch.cat([q_nope, q_rope], dim=-1), "b s nh a -> b nh s a")
+
+        latent_raw, k_rope = torch.split(
+            self.wkv_a(x), [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        latent = self.kv_norm(latent_raw)
+        k_rope = apply_rotary_emb(rearrange(k_rope, "b s rh -> b s 1 rh"), freqs_cis)
+        shared_cache = rearrange(
+            torch.cat([rearrange(latent, "b s l -> b s 1 l"), k_rope], dim=-1),
+            "b s 1 z -> b 1 s z",
+        )
+
+        k = shared_cache
+        v = shared_cache[..., : self.kv_lora_rank]
+        latent_output = rearrange(
+            self.inner_attention(q, k, v, scale=self.softmax_scale), "b nh s l -> b s (nh l)"
+        )
+
+        return self.wo_abs(latent_output)
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, model_args: DeepSeekV3ModelArgs):
         super().__init__()
         self.attention = Attention(model_args)
         self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.ffn_norm = nn.RMSNorm()
+        self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
         self.moe_enabled = layer_id >= model_args.n_dense_layers
         if self.moe_enabled:
@@ -128,7 +202,7 @@ class DeepSeekV3Model(nn.Module):
         for layer_id in range(model_args.n_layers):
             self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
 
-        self.norm = nn.RMSNorm(model_args.dim)
+        self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.output = nn.Linear(
             model_args.dim, model_args.vocab_size, dtype=torch.get_default_dtype(), bias=False
         )
