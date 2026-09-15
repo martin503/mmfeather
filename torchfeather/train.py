@@ -4,9 +4,9 @@ import contextlib
 import os
 import signal
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import timedelta
-from typing import cast
+from typing import Any, cast
 
 import torch
 from jaxtyping import Float, Int
@@ -233,6 +233,32 @@ class Trainer(Stateful):
             world_size=world_size,
         )
 
+    def batch_generator(
+        self, data_iterable: Iterable[tuple[dict[str, Int[Tensor, "B S"]], Int[Tensor, "B S"]]]
+    ) -> Iterator[tuple[dict[str, Int[Tensor, "B S"]], Int[Tensor, "B S"]]]:
+        device_type = device_utils.device_type
+        data_iterator = iter(data_iterable)
+
+        while True:
+            data_load_start = time.perf_counter()
+            try:
+                batch = next(data_iterator)
+            except StopIteration as ex:
+                raise DataloaderExhaustedError() from ex
+
+            input_dict, labels = batch
+            ntokens_batch = labels.numel()
+            ntokens_batch //= self.parallel_dims.cp
+            self.ntokens_seen += ntokens_batch
+            self.metrics_processor.ntokens_since_last_log += ntokens_batch
+            self.metrics_processor.data_loading_times.append(time.perf_counter() - data_load_start)
+
+            for k, v in input_dict.items():
+                if isinstance(v, Tensor):
+                    input_dict[k] = v.to(device_type)
+            labels = labels.to(device_type)
+            yield input_dict, labels
+
     def forward_backward_step(
         self,
         input_dict: dict[str, Int[Tensor, "B S"]],
@@ -423,15 +449,31 @@ class Trainer(Stateful):
             time.sleep(2)
             logger.info("Training completed")
 
+    def should_continue_training(self) -> bool:
+        return self.step < self.job_config.training.steps
 
-def _any_successful_shutdown_watchdog(timeout_seconds: int = 30):
+    def state_dict(self) -> dict[str, Any]:
+        return {"step": self.step, "ntokens_seen": self.ntokens_seen}
+
+    def load_state_dict(self, state_dict: dict[str, Any]):
+        self.step = state_dict["step"]
+        self.ntokens_seen = state_dict["ntokens_seen"]
+
+    def close(self) -> None:
+        if hasattr(self, "checkpointer") and self.checkpointer:
+            self.checkpointer.close()
+        if hasattr(self, "metrics_processor") and self.metrics_processor:
+            self.metrics_processor.close()
+
+
+def _arm_successful_shutdown_watchdog(timeout_seconds: int = 30):
     logger.info(f"Arming post-training shutdown watchdog (SIGALRM) for {timeout_seconds} seconds")
     signal.signal(signal.SIGALRM, signal.SIG_DFL)
     signal.alarm(timeout_seconds)
 
 
 def _shutdown_after_successful_training(trainer: Trainer):
-    _any_successful_shutdown_watchdog()
+    _arm_successful_shutdown_watchdog()
     trainer.close()
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
