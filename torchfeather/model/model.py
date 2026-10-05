@@ -232,8 +232,9 @@ class DeepSeekV3Model(nn.Module):
             )
 
     def forward(self, tokens: Int[Tensor, "B S"]) -> Float[Tensor, "B S V"]:
-        h = self.tok_embeddings(tokens)
+        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
         for layer in self.layers.values():
             h = layer(h, self.freqs_cis)
-        output = self.output(self.norm(h))
+        h = self.norm(h) if self.norm is not None else h
+        output = self.output(h) if self.output is not None else h
         return output
